@@ -270,129 +270,175 @@ def _render_single_run(
     gif_fps: int,
     gif_name: str,
     gifski_bin: str,
-    margin_frac: float = 0.03,          # ← added: % margin around arena
+    margin_frac: float = 0.03,
 ) -> List[str]:
     """
-    Render one run.  Axis limits are fixed from the full run extent,
-    so early frames no longer have "smaller borders".
+    High-performance version: same visual output, far faster.
+    Avoids per-frame figure creation and avoids all DataFrame operations inside the loop.
     """
+    # Sort once
     run_df = run_df.sort_values(["time", "robot_id"], ignore_index=True)
 
-    # ── arena bounds (fixed for every frame) ────────────────────────────
-    # Exclude walls from bounds so they don't affect the visible extent
-    if "robot_category" in run_df.columns:
-        plotting_df = run_df[run_df["robot_category"] != "walls"]
-    else:
-        plotting_df = run_df
+    # Extract unique times
+    times = run_df["time"].to_numpy()
+    unique_times = np.unique(times)
 
-    x_min, x_max = plotting_df["x"].min(), plotting_df["x"].max()
-    y_min, y_max = plotting_df["y"].min(), plotting_df["y"].max()
-    # add a small margin so dots aren’t exactly on the edge
-    dx, dy = x_max - x_min, y_max - y_min
+    # Remove walls for bounds
+    if "robot_category" in run_df.columns:
+        df_plot = run_df[run_df["robot_category"] != "walls"]
+    else:
+        df_plot = run_df
+
+    xs_all = df_plot["x"].to_numpy()
+    ys_all = df_plot["y"].to_numpy()
+
+    # Global bounds
+    x_min, x_max = xs_all.min(), xs_all.max()
+    y_min, y_max = ys_all.min(), ys_all.max()
+
+    dx = x_max - x_min
+    dy = y_max - y_min
     x_min -= dx * margin_frac
     x_max += dx * margin_frac
     y_min -= dy * margin_frac
     y_max += dy * margin_frac
 
-    times = run_df["time"].unique()
-
-    # Build a map robot_id -> robot_category (first seen value per id)
+    # Category map
     if "robot_category" in run_df.columns:
         category_map = run_df.groupby("robot_id", sort=False)["robot_category"].first().to_dict()
     else:
         category_map = {}
 
-    # Agent ids (used for coloured traces). Animals will be drawn as green dots
-    agent_ids = np.sort([rid for rid, cat in category_map.items() if cat == "agents"]) if category_map else np.sort(run_df["robot_id"].unique())
+    # Pre-split into per-robot NumPy arrays
+    robots = {}
+    for rid, g in run_df.groupby("robot_id"):
+        arr = g[["time", "x", "y"]].to_numpy()
+        robots[rid] = arr
+
+    # Colour assignment:
+    #   - animals are green
+    #   - everything else gets a colour
     cmap = get_cmap(robot_cmap_name)
-    colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(agent_ids)}
 
-    tail_times: List[float] = []
-    frame_paths: List[str]  = []
+    # Determine all non-animal robots
+    colour_ids = []
+    for rid in robots:
+        cat = category_map.get(rid, "agents")
+        if cat != "animals":
+            colour_ids.append(rid)
 
+    colour_ids = np.sort(colour_ids)
+    colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(colour_ids)}
+
+    # Prepare artists
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for current_time in tqdm(times, desc="Rendering frames"):
+    # Prepare figure once
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
+    ax.set_aspect("equal")
+    ax.set_facecolor("white")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xticks([]); ax.set_yticks([])
+
+    line_artists = {}
+    point_artists = {}
+
+    from matplotlib.collections import LineCollection
+
+    # Create artist containers
+    for rid in robots:
+        cat = category_map.get(rid, "agents")
+        if cat == "animals":
+            # Only green point
+            sc = ax.scatter([], [], s=point_size, c="green", edgecolors="none")
+            point_artists[rid] = sc
+        else:
+            # Line + coloured head point
+            lc = LineCollection([], linewidths=line_width, capstyle="round", joinstyle="round")
+            ax.add_collection(lc)
+            line_artists[rid] = lc
+
+            col = colour_map[rid]
+            sc = ax.scatter([], [], s=point_size, c=[col], edgecolors="none")
+            point_artists[rid] = sc
+
+    title_obj = ax.set_title("")
+
+    fig.tight_layout()
+
+    frame_paths = []
+    tail_times = []
+
+    # Main loop (fast)
+    for current_time in tqdm(unique_times):
         tail_times.append(current_time)
         if len(tail_times) > k_steps:
             tail_times.pop(0)
 
-        window_df = run_df[run_df["time"].isin(tail_times)]
-        # remove walls from plotting window
-        if "robot_category" in window_df.columns:
-            window_df_plot = window_df[window_df["robot_category"] != "walls"]
-        else:
-            window_df_plot = window_df
-        t_old, t_new = tail_times[0], tail_times[-1]
+        t_old = tail_times[0]
+        t_new = tail_times[-1]
         age_den = (t_new - t_old) or 1.0
 
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_facecolor("white")
-        ax.set_xticks([]); ax.set_yticks([])
+        # Update each robot
+        for rid, arr in robots.items():
+            ts = arr[:, 0]
+            xs = arr[:, 1]
+            ys = arr[:, 2]
 
-        # ← NEW: keep arena size constant
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-
-        for rid, group in window_df_plot.groupby("robot_id", sort=False):
-            g = group.sort_values("time")
-            cat = category_map.get(rid, "agents")
-
-            # Animals: draw as green dots only at the current time (teleporting)
-            if cat == "animals":
-                cur = g[g["time"] == current_time]
-                if cur.empty:
-                    continue
-                x_cur = cur["x"].to_numpy()[-1]
-                y_cur = cur["y"].to_numpy()[-1]
-                ax.scatter(x_cur, y_cur,
-                           s=point_size,
-                           c="green",
-                           edgecolors="none")
+            mask = (ts >= t_old) & (ts <= t_new)
+            if not np.any(mask):
+                if rid in line_artists:
+                    line_artists[rid].set_segments([])
+                point_artists[rid].set_offsets(np.empty((0, 2)))
                 continue
 
-            # Agents: keep the fading trail behaviour
-            xs, ys, ts = g["x"].to_numpy(), g["y"].to_numpy(), g["time"].to_numpy()
+            xs_win = xs[mask]
+            ys_win = ys[mask]
+            ts_win = ts[mask]
 
-            if len(xs) > 1 and rid in colour_map:
+            cat = category_map.get(rid, "agents")
+
+            if cat == "animals":
+                point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+                continue
+
+            # Agents / non-animal bots
+            if len(xs_win) >= 2:
                 segs = np.stack(
-                    [np.column_stack([xs[:-1], ys[:-1]]),
-                     np.column_stack([xs[1:],  ys[1: ]])],
+                    [
+                        np.column_stack([xs_win[:-1], ys_win[:-1]]),
+                        np.column_stack([xs_win[1:], ys_win[1:]])
+                    ],
                     axis=1
                 )
-                seg_ages   = (ts[1:] - t_old) / age_den
-                seg_alphas = fade_min_alpha + (1 - fade_min_alpha) * seg_ages
-                seg_rgba   = [(*colour_map[rid], a) for a in seg_alphas]
+                seg_ages = (ts_win[1:] - t_old) / age_den
+                alphas = fade_min_alpha + (1 - fade_min_alpha) * seg_ages
+                cols = [(*colour_map[rid], a) for a in alphas]
 
-                ax.add_collection(LineCollection(
-                    segs,
-                    colors     = seg_rgba,
-                    linewidths = line_width,
-                    capstyle   = "round",
-                    joinstyle  = "round",
-                ))
+                line_artists[rid].set_segments(segs)
+                line_artists[rid].set_color(cols)
+            else:
+                line_artists[rid].set_segments([])
 
-            # Scatter the most recent agent position
-            if len(xs) > 0 and rid in colour_map:
-                ax.scatter(xs[-1], ys[-1],
-                           s=point_size,
-                           c=[colour_map[rid]],
-                           edgecolors="none")
+            # Head point
+            point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
 
-        ax.set_title(f"time = {current_time:.3f}   (tail = {len(tail_times)} steps)")
-        fig.tight_layout()
+        title_obj.set_text(f"time = {current_time:.3f}   (tail = {len(tail_times)} steps)")
 
+        # Save frame
         fname = run_output_dir / f"trace_{current_time:.6f}.png"
         fig.savefig(fname, dpi=dpi)
-        plt.close(fig)
         frame_paths.append(str(fname.resolve()))
 
+    plt.close(fig)
+
+    # Compile GIF if needed
     if make_gif and frame_paths:
         _compile_gif(frame_paths,
                      run_output_dir / gif_name,
-                     fps = gif_fps,
-                     gifski_bin = gifski_bin)
+                     fps=gif_fps,
+                     gifski_bin=gifski_bin)
 
     return frame_paths
 
@@ -537,7 +583,7 @@ def generate_trace_images(
 
 ############### MAIN ############### {{{1
 
-def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[float] = None, end_time: Optional[float] = None):
+def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[float] = None, end_time: Optional[float] = None, plot_run_id: Optional[int] = None):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load data
@@ -558,7 +604,7 @@ def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[flo
     trace_path = os.path.join(output_dir, "traces")
     shutil.rmtree(trace_path, ignore_errors=True)
     os.makedirs(trace_path, exist_ok=True)
-    generate_trace_images(df, k_steps=20, output_dir=trace_path, make_gif=True, start_time=start_time, end_time=end_time)
+    generate_trace_images(df, k_steps=20, output_dir=trace_path, make_gif=True, start_time=start_time, end_time=end_time, run_id=plot_run_id)
 
 
 if __name__ == "__main__":
@@ -568,11 +614,12 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output_dir', type=str, default=".", help = "Directory of the resulting plot files")
     parser.add_argument('--start_time', type=float, default=None, help = "Start time (inclusive) for traces; default = dataset min time")
     parser.add_argument('--end_time', type=float, default=None, help = "End time (inclusive) for traces; default = dataset max time")
+    parser.add_argument('--run_id', type=int, default=None, help = "If provided, only process this run ID")
     args = parser.parse_args()
 
     input_file = args.input_file
     output_dir = args.output_dir
-    create_all_locomotion_plots(input_file, output_dir, start_time=args.start_time, end_time=args.end_time)
+    create_all_locomotion_plots(input_file, output_dir, start_time=args.start_time, end_time=args.end_time, plot_run_id=args.run_id)
 
 
 # MODELINE "{{{1
