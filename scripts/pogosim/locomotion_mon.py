@@ -2,27 +2,26 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import shutil
 import subprocess
-import multiprocessing as mp
+import tempfile
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 from matplotlib.cm import get_cmap
 from matplotlib.collections import LineCollection
-import numpy as np
-import seaborn as sns
-import pandas as pd
 from tqdm import tqdm
 
-from pogosim import utils
-from pogosim import __version__
-import tempfile
-
+from pogosim import __version__, utils
 
 ############### MSD ############### {{{1
+
 
 def compute_msd_per_agent(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -41,52 +40,61 @@ def compute_msd_per_agent(df: pd.DataFrame) -> pd.DataFrame:
             ['run','robot_category','robot_id','MSD']
     """
     # Validate required columns (arena_file is optional)
-    required = ['time', 'robot_category', 'robot_id', 'x', 'y', 'run']
+    required = ["time", "robot_category", "robot_id", "x", "y", "run"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Input dataframe missing required columns: {missing}")
 
-    has_arena = 'arena_file' in df.columns
+    has_arena = "arena_file" in df.columns
 
     # Keep only rows with finite positions
-    work = df.loc[np.isfinite(df['x']) & np.isfinite(df['y'])].copy()
+    work = df.loc[np.isfinite(df["x"]) & np.isfinite(df["y"])].copy()
 
     # Sort so groupby('first') is well-defined: prefer ticks if present, then time
-    sort_cols = (['arena_file'] if has_arena else []) + ['run', 'robot_category', 'robot_id']
-    if 'pogobot_ticks' in work.columns:
-        sort_cols += ['pogobot_ticks', 'time']
+    sort_cols = (["arena_file"] if has_arena else []) + [
+        "run",
+        "robot_category",
+        "robot_id",
+    ]
+    if "pogobot_ticks" in work.columns:
+        sort_cols += ["pogobot_ticks", "time"]
     else:
-        sort_cols += ['time']
-    work = work.sort_values(sort_cols, kind='mergesort')  # stable
+        sort_cols += ["time"]
+    work = work.sort_values(sort_cols, kind="mergesort")  # stable
 
     # Grouping keys
-    group_keys = (['arena_file'] if has_arena else []) + ['run', 'robot_category', 'robot_id']
+    group_keys = (["arena_file"] if has_arena else []) + [
+        "run",
+        "robot_category",
+        "robot_id",
+    ]
 
     # First position per agent group (after sorting)
-    x0 = work.groupby(group_keys, sort=False)['x'].transform('first')
-    y0 = work.groupby(group_keys, sort=False)['y'].transform('first')
+    x0 = work.groupby(group_keys, sort=False)["x"].transform("first")
+    y0 = work.groupby(group_keys, sort=False)["y"].transform("first")
 
     # Instantaneous squared displacement relative to first sample
-    dx = work['x'] - x0
-    dy = work['y'] - y0
-    work['__msd__'] = dx * dx + dy * dy
+    dx = work["x"] - x0
+    dy = work["y"] - y0
+    work["__msd__"] = dx * dx + dy * dy
 
     # Mean over time within each group
     out = (
-        work.groupby(group_keys, sort=False)['__msd__']
-            .mean()
-            .reset_index()
-            .rename(columns={'__msd__': 'MSD'})
+        work.groupby(group_keys, sort=False)["__msd__"]
+        .mean()
+        .reset_index()
+        .rename(columns={"__msd__": "MSD"})
     )
 
     # Order columns nicely
-    ordered_cols = group_keys + ['MSD']
+    ordered_cols = group_keys + ["MSD"]
     out = out[ordered_cols]
 
     return out
 
 
 ############### HEATMAP ############### {{{1
+
 
 def plot_arena_heatmaps(
     df: pd.DataFrame,
@@ -107,15 +115,15 @@ def plot_arena_heatmaps(
     use_kde: bool = False,
     show_grid_lines: bool = False,
     show_axes_labels: bool = True,
-    bin_value: str = "count",             # "count" | "density"
-    cbar_shrink: float = 0.80,            # colour-bar height factor
+    bin_value: str = "count",  # "count" | "density"
+    cbar_shrink: float = 0.80,  # colour-bar height factor
 ) -> None:
     """
     Render one landscape PDF page that holds a left-to-right row of heat-maps,
     **with X and Y axes in real coordinates**.
     """
 
-    sns.set_context("paper", font_scale=1.5)      # (3) bigger everything
+    sns.set_context("paper", font_scale=1.5)  # (3) bigger everything
     plt.rcParams["axes.titlesize"] = "x-large"
     plt.rcParams["axes.labelsize"] = "large"
 
@@ -179,7 +187,7 @@ def plot_arena_heatmaps(
 
             mappable = ax.imshow(
                 hist,
-                origin="upper",                        # row 0 at top …
+                origin="upper",  # row 0 at top …
                 extent=[x_edges[0], x_edges[-1], y_edges[-1], y_edges[0]],
                 cmap=cmap,
                 norm=norm,
@@ -229,6 +237,7 @@ def plot_arena_heatmaps(
 
 
 ############### TRACES ############### {{{1
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  gifski helper
@@ -309,7 +318,11 @@ def _render_single_run(
 
         # Category map
         if "robot_category" in run_df.columns:
-            category_map = run_df.groupby("robot_id", sort=False)["robot_category"].first().to_dict()
+            category_map = (
+                run_df.groupby("robot_id", sort=False)["robot_category"]
+                .first()
+                .to_dict()
+            )
         else:
             category_map = {}
 
@@ -324,7 +337,9 @@ def _render_single_run(
         #   - everything else gets a colour
 
         cmap = get_cmap(robot_cmap_name)
-        colour_ids = [rid for rid in robots if category_map.get(rid, "agents") != "animals"]
+        colour_ids = [
+            rid for rid in robots if category_map.get(rid, "agents") != "animals"
+        ]
         colour_ids = np.sort(colour_ids)
         colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(colour_ids)}
 
@@ -348,7 +363,9 @@ def _render_single_run(
                 point_artists[rid] = sc
             else:
                 # Line + coloured head point
-                lc = LineCollection([], linewidths=line_width, capstyle="round", joinstyle="round")
+                lc = LineCollection(
+                    [], linewidths=line_width, capstyle="round", joinstyle="round"
+                )
                 ax.add_collection(lc)
                 line_artists[rid] = lc
 
@@ -401,9 +418,9 @@ def _render_single_run(
                     segs = np.stack(
                         [
                             np.column_stack([xs_win[:-1], ys_win[:-1]]),
-                            np.column_stack([xs_win[1:], ys_win[1:]])
+                            np.column_stack([xs_win[1:], ys_win[1:]]),
                         ],
-                        axis=1
+                        axis=1,
                     )
                     seg_ages = (ts_win[1:] - t_old) / age_den
                     alphas = fade_min_alpha + (1 - fade_min_alpha) * seg_ages
@@ -427,7 +444,9 @@ def _render_single_run(
 
         # Compile GIF
         if make_gif and frame_paths:
-            _compile_gif(frame_paths, gif_path=gif_path, fps=gif_fps, gifski_bin=gifski_bin)
+            _compile_gif(
+                frame_paths, gif_path=gif_path, fps=gif_fps, gifski_bin=gifski_bin
+            )
 
     finally:
         # Delete the entire temporary frames directory
@@ -470,7 +489,8 @@ def generate_trace_images(
     gif_fps: int = 20,
     gifski_bin: str = "gifski",
     # Parallelism
-    n_jobs: int | None = None):
+    n_jobs: int | None = None,
+):
     """
     Render fading-trail PNGs (and optional GIFs) from a robot-trace dataframe.
 
@@ -543,9 +563,17 @@ def generate_trace_images(
     gif_path = base_dir / "trace_0.gif"
     return _render_single_run(df, gif_path=gif_path, **common_kw)
 
+
 ############### MAIN ############### {{{1
 
-def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[float] = None, end_time: Optional[float] = None, plot_run_id: Optional[int] = None):
+
+def create_all_locomotion_plots(
+    input_file,
+    output_dir,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    plot_run_id: Optional[int] = None,
+):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load data
@@ -566,22 +594,61 @@ def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[flo
     trace_path = os.path.join(output_dir, "traces")
     shutil.rmtree(trace_path, ignore_errors=True)
     os.makedirs(trace_path, exist_ok=True)
-    generate_trace_images(df, k_steps=20, output_dir=trace_path, make_gif=True, start_time=start_time, end_time=end_time, run_id=plot_run_id)
+    generate_trace_images(
+        df,
+        k_steps=20,
+        output_dir=trace_path,
+        make_gif=True,
+        start_time=start_time,
+        end_time=end_time,
+        run_id=plot_run_id,
+    )
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input_file', type=str, default='results/result.feather', help = "Path of the input feather file")
-    parser.add_argument('-o', '--output_dir', type=str, default=".", help = "Directory of the resulting plot files")
-    parser.add_argument('--start_time', type=float, default=None, help = "Start time (inclusive) for traces; default = dataset min time")
-    parser.add_argument('--end_time', type=float, default=None, help = "End time (inclusive) for traces; default = dataset max time")
-    parser.add_argument('--run_id', type=int, default=None, help = "If provided, only process this run ID")
+    parser.add_argument(
+        "-i",
+        "--input_file",
+        type=str,
+        default="results/result.feather",
+        help="Path of the input feather file",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_dir",
+        type=str,
+        default=".",
+        help="Directory of the resulting plot files",
+    )
+    parser.add_argument(
+        "--start_time",
+        type=float,
+        default=None,
+        help="Start time (inclusive) for traces; default = dataset min time",
+    )
+    parser.add_argument(
+        "--end_time",
+        type=float,
+        default=None,
+        help="End time (inclusive) for traces; default = dataset max time",
+    )
+    parser.add_argument(
+        "--run_id", type=int, default=None, help="If provided, only process this run ID"
+    )
     args = parser.parse_args()
 
     input_file = args.input_file
     output_dir = args.output_dir
-    create_all_locomotion_plots(input_file, output_dir, start_time=args.start_time, end_time=args.end_time, plot_run_id=args.run_id)
+    create_all_locomotion_plots(
+        input_file,
+        output_dir,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        plot_run_id=args.run_id,
+    )
 
 
 # MODELINE "{{{1
