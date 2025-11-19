@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import multiprocessing as mp
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Tuple
+from typing import List, Dict, Tuple, Optional, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
@@ -15,6 +15,7 @@ from matplotlib.collections import LineCollection
 import numpy as np
 import seaborn as sns
 import pandas as pd
+from tqdm import tqdm
 
 from pogosim import utils
 from pogosim import __version__
@@ -278,8 +279,14 @@ def _render_single_run(
     run_df = run_df.sort_values(["time", "robot_id"], ignore_index=True)
 
     # ── arena bounds (fixed for every frame) ────────────────────────────
-    x_min, x_max = run_df["x"].min(), run_df["x"].max()
-    y_min, y_max = run_df["y"].min(), run_df["y"].max()
+    # Exclude walls from bounds so they don't affect the visible extent
+    if "robot_category" in run_df.columns:
+        plotting_df = run_df[run_df["robot_category"] != "walls"]
+    else:
+        plotting_df = run_df
+
+    x_min, x_max = plotting_df["x"].min(), plotting_df["x"].max()
+    y_min, y_max = plotting_df["y"].min(), plotting_df["y"].max()
     # add a small margin so dots aren’t exactly on the edge
     dx, dy = x_max - x_min, y_max - y_min
     x_min -= dx * margin_frac
@@ -287,22 +294,35 @@ def _render_single_run(
     y_min -= dy * margin_frac
     y_max += dy * margin_frac
 
-    times      = run_df["time"].unique()
-    robot_ids  = np.sort(run_df["robot_id"].unique())
-    cmap       = get_cmap(robot_cmap_name)
-    colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(robot_ids)}
+    times = run_df["time"].unique()
+
+    # Build a map robot_id -> robot_category (first seen value per id)
+    if "robot_category" in run_df.columns:
+        category_map = run_df.groupby("robot_id", sort=False)["robot_category"].first().to_dict()
+    else:
+        category_map = {}
+
+    # Agent ids (used for coloured traces). Animals will be drawn as green dots
+    agent_ids = np.sort([rid for rid, cat in category_map.items() if cat == "agents"]) if category_map else np.sort(run_df["robot_id"].unique())
+    cmap = get_cmap(robot_cmap_name)
+    colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(agent_ids)}
 
     tail_times: List[float] = []
     frame_paths: List[str]  = []
 
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for current_time in times:
+    for current_time in tqdm(times, desc="Rendering frames"):
         tail_times.append(current_time)
         if len(tail_times) > k_steps:
             tail_times.pop(0)
 
         window_df = run_df[run_df["time"].isin(tail_times)]
+        # remove walls from plotting window
+        if "robot_category" in window_df.columns:
+            window_df_plot = window_df[window_df["robot_category"] != "walls"]
+        else:
+            window_df_plot = window_df
         t_old, t_new = tail_times[0], tail_times[-1]
         age_den = (t_new - t_old) or 1.0
 
@@ -315,11 +335,27 @@ def _render_single_run(
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
 
-        for rid, group in window_df.groupby("robot_id", sort=False):
+        for rid, group in window_df_plot.groupby("robot_id", sort=False):
             g = group.sort_values("time")
+            cat = category_map.get(rid, "agents")
+
+            # Animals: draw as green dots only at the current time (teleporting)
+            if cat == "animals":
+                cur = g[g["time"] == current_time]
+                if cur.empty:
+                    continue
+                x_cur = cur["x"].to_numpy()[-1]
+                y_cur = cur["y"].to_numpy()[-1]
+                ax.scatter(x_cur, y_cur,
+                           s=point_size,
+                           c="green",
+                           edgecolors="none")
+                continue
+
+            # Agents: keep the fading trail behaviour
             xs, ys, ts = g["x"].to_numpy(), g["y"].to_numpy(), g["time"].to_numpy()
 
-            if len(xs) > 1:
+            if len(xs) > 1 and rid in colour_map:
                 segs = np.stack(
                     [np.column_stack([xs[:-1], ys[:-1]]),
                      np.column_stack([xs[1:],  ys[1: ]])],
@@ -337,10 +373,12 @@ def _render_single_run(
                     joinstyle  = "round",
                 ))
 
-            ax.scatter(xs[-1], ys[-1],
-                       s = point_size,
-                       c = [colour_map[rid]],
-                       edgecolors = "none")
+            # Scatter the most recent agent position
+            if len(xs) > 0 and rid in colour_map:
+                ax.scatter(xs[-1], ys[-1],
+                           s=point_size,
+                           c=[colour_map[rid]],
+                           edgecolors="none")
 
         ax.set_title(f"time = {current_time:.3f}   (tail = {len(tail_times)} steps)")
         fig.tight_layout()
@@ -385,10 +423,14 @@ def generate_trace_images(
     fade_min_alpha: float = 0.1,
     dpi: int = 150,
     run_fmt: str = "run_{run}",
+    # Time window to plot traces for. Use two separate params:
+    # `start_time` and `end_time` (both inclusive). Either may be `None`.
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
     # GIF options
     make_gif: bool = False,
     gif_fps: int = 20,
-    gif_name: str = "trace.gif",
+    gif_name: str = "result-trace.gif",
     gifski_bin: str = "gifski",
     # Parallelism
     n_jobs: int | None = None,
@@ -402,6 +444,18 @@ def generate_trace_images(
         • Set `n_jobs=1` to disable the pool (sequential).
     """
     df = df.copy()
+
+    # ---- apply start_time / end_time filter if provided --------------
+    if start_time is not None or end_time is not None:
+        if "time" not in df.columns:
+            raise ValueError("DataFrame has no 'time' column for time filtering")
+        tmin = df["time"].min()
+        tmax = df["time"].max()
+        t0 = start_time if start_time is not None else tmin
+        t1 = end_time if end_time is not None else tmax
+        if t0 > t1:
+            t0, t1 = t1, t0
+        df = df[(df["time"] >= float(t0)) & (df["time"] <= float(t1))].copy()
 
     # ------------ single-run request -------------------------------------
     if run_id is not None:
@@ -483,7 +537,7 @@ def generate_trace_images(
 
 ############### MAIN ############### {{{1
 
-def create_all_locomotion_plots(input_file, output_dir):
+def create_all_locomotion_plots(input_file, output_dir, start_time: Optional[float] = None, end_time: Optional[float] = None):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load data
@@ -495,28 +549,30 @@ def create_all_locomotion_plots(input_file, output_dir):
         df["run"] = 0
 
     # Create Heatmaps
-    print("Creating heatmaps...")
-    plot_arena_heatmaps(df, bins=30, pdf_path=os.path.join(output_dir, "arena_heatmaps.pdf"), use_kde=False, bin_value="density", show_grid_lines=False)
-    plot_arena_heatmaps(df, bins=30, pdf_path=os.path.join(output_dir, "arena_heatmaps_kde.pdf"), use_kde=True, bin_value="density", show_grid_lines=False)
+    # print("Creating heatmaps...")
+    # plot_arena_heatmaps(df, bins=30, pdf_path=os.path.join(output_dir, "arena_heatmaps.pdf"), use_kde=False, bin_value="density", show_grid_lines=False)
+    # plot_arena_heatmaps(df, bins=30, pdf_path=os.path.join(output_dir, "arena_heatmaps_kde.pdf"), use_kde=True, bin_value="density", show_grid_lines=False)
 
     # Create trace plots
     print("Creating trace plots...")
     trace_path = os.path.join(output_dir, "traces")
     shutil.rmtree(trace_path, ignore_errors=True)
     os.makedirs(trace_path, exist_ok=True)
-    generate_trace_images(df, k_steps=20, output_dir=trace_path, make_gif=True)
+    generate_trace_images(df, k_steps=20, output_dir=trace_path, make_gif=True, start_time=start_time, end_time=end_time)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--inputFile', type=str, default='results/result.feather', help = "Path of the input feather file")
-    parser.add_argument('-o', '--outputDir', type=str, default=".", help = "Directory of the resulting plot files")
+    parser.add_argument('-i', '--input_file', type=str, default='results/result.feather', help = "Path of the input feather file")
+    parser.add_argument('-o', '--output_dir', type=str, default=".", help = "Directory of the resulting plot files")
+    parser.add_argument('--start_time', type=float, default=None, help = "Start time (inclusive) for traces; default = dataset min time")
+    parser.add_argument('--end_time', type=float, default=None, help = "End time (inclusive) for traces; default = dataset max time")
     args = parser.parse_args()
 
-    input_file = args.inputFile
-    output_dir = args.outputDir
-    create_all_locomotion_plots(input_file, output_dir)
+    input_file = args.input_file
+    output_dir = args.output_dir
+    create_all_locomotion_plots(input_file, output_dir, start_time=args.start_time, end_time=args.end_time)
 
 
 # MODELINE "{{{1
