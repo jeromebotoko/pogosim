@@ -102,3 +102,5 @@ latex
 __pycache__
 *.egg-info
 dist/
+.vscode/settings.json
+.DS_Store

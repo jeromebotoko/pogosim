@@ -320,6 +320,34 @@ public:
      */
     arena_polygons_t const& get_arena_geometry() { return arena_polygons; };
 
+    /**
+     * @brief Get a random valid position inside the arena that respects a reserve radius.
+     *
+     * The returned coordinates are in the same units used by formation generators
+     * and by `Object::move` (i.e. the arena coordinate system used throughout the code).
+     *
+     * @param reserve_radius Minimum clearance radius to respect around the point.
+     * @param max_neighbor_distance Optional connectivity parameter passed to the sampler.
+     * @return b2Vec2 The chosen position (may contain NaNs on failure).
+     */
+    b2Vec2 get_random_position(float reserve_radius, float max_neighbor_distance = INFINITY);
+
+    /**
+     * @brief Teleport a robot (by id) to a desired coordinate.
+     *
+     * If `avoid_collisions` is true the function verifies that the target
+     * location is not colliding with walls or other physical objects and
+     * rejects the request if unsafe.
+     *
+     * @param robot_id Id of the robot to teleport.
+     * @param x X coordinate in arena units.
+     * @param y Y coordinate in arena units.
+     * @param theta Orientation in radians (NAN to keep current orientation).
+     * @param avoid_collisions Whether to refuse unsafe placements.
+     * @return true if teleport performed, false otherwise.
+     */
+    bool teleport_robot_by_id(uint16_t robot_id, float x, float y, float theta = NAN, bool avoid_collisions = true);
+
 };
 
 /// Global simulation instance.

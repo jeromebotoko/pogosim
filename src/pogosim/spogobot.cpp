@@ -15,6 +15,7 @@
 #include "pogosim.h"
 #include "simulator.h"
 #include "version.h"
+#include <cmath>
 
 
 /************* GLOBALS *************/ // {{{1
@@ -646,6 +647,22 @@ void init_string_from_configuration(char *var,
         // Fall back to default
         value = default_value;
     }
+}
+
+/* Teleport API implementations exposed to robot user code */
+bool pogobot_teleport_to(float x, float y, float theta) {
+    if (!simulation) return false;
+    bool ok = simulation->teleport_robot_by_id(current_robot->id, x, y, theta, true);
+    return ok;
+}
+
+bool pogobot_teleport_random(void) {
+    if (!simulation) return false;
+    float reserve = current_robot->get_geometry()->compute_bounding_disk().radius;
+    b2Vec2 p = simulation->get_random_position(reserve);
+    if (std::isnan(p.x) || std::isnan(p.y)) return false;
+    bool ok = simulation->teleport_robot_by_id(current_robot->id, p.x, p.y, NAN, true);
+    return ok;
 }
 
 void init_float_array_from_configuration(float* var, char const* name, size_t const size) {

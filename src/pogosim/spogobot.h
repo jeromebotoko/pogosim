@@ -1043,6 +1043,10 @@ void init_float_array_from_configuration(float* var, char const* name, size_t co
 void init_double_array_from_configuration(double* var, char const* name, size_t const size);
 void init_string_from_configuration(char *var, char const *name, size_t const size);
 
+/* Teleport API (simulator only) */
+bool pogobot_teleport_to(float x, float y, float theta);
+bool pogobot_teleport_random(void);
+
 #ifdef __cplusplus
 }
 #endif

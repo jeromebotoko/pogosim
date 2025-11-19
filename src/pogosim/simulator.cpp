@@ -67,6 +67,104 @@ void set_current_robot(PogobotObject& robot) {
     nb_msgs_recv                  = robot.nb_msgs_recv;
 }
 
+b2Vec2 Simulation::get_random_position(float reserve_radius, float max_neighbor_distance)
+{
+    // Use the existing safe sampler to obtain one point respecting 'reserve_radius'.
+    std::vector<float> radii = { reserve_radius };
+
+    const unsigned formation_attempts_per_point = 30u;
+    const unsigned formation_max_restarts = 5u;
+
+    auto points = generate_random_points_within_polygon_safe(arena_polygons, radii, max_neighbor_distance, formation_attempts_per_point, formation_max_restarts);
+
+    if (points.empty()) {
+        return b2Vec2{NAN, NAN};
+    }
+
+    // generate_random_points_within_polygon_safe returns coordinates in arena units
+    const auto &p = points.front();
+    return b2Vec2{p.x, p.y};
+}
+
+bool Simulation::teleport_robot_by_id(uint16_t robot_id, float x, float y, float theta, bool avoid_collisions)
+{
+    // find robot
+    std::shared_ptr<PogobotObject> target;
+    for (auto &r : robots) {
+        if (!r) continue;
+        if (r->id == robot_id) { target = r; break; }
+    }
+    if (!target) {
+        return false;
+    }
+
+    if (!avoid_collisions) {
+        target->move(x, y, theta);
+        return true;
+    }
+
+    // Quick checks using arena geometry and other physical objects.
+    // 1) inside outer polygon and not inside holes
+    if (arena_polygons.empty()) {
+        return false;
+    }
+
+    // outer polygon is the first polygon in the vector
+    if (!is_point_within_polygon(arena_polygons.front(), x, y)) {
+        return false;
+    }
+    // check holes (remaining polygons)
+    for (size_t i = 1; i < arena_polygons.size(); ++i) {
+        if (is_point_within_polygon(arena_polygons[i], x, y)) {
+            return false;
+        }
+    }
+
+    // 2) distance to walls
+    ArenaGeometry arenaGeom(arena_polygons);
+    float dist_to_wall = arenaGeom.get_distance_to({}, { x, y });
+    // Allow configuration to relax teleport clearance checks when arenas are small.
+    // Default to 1.0 so we don't require extra clearance from walls by default.
+    const float wall_clearance_factor = config["parameters"]["teleport_wall_clearance_factor"].get(1.0f);
+    float required_wall_clearance = target->get_geometry()->compute_bounding_disk().radius * wall_clearance_factor;
+    if (dist_to_wall < required_wall_clearance) {
+        return false;
+    }
+
+    // 3) distance to other physical objects
+    const float inter_object_buffer = 0.0f; // default buffer in mm (0 by default)
+    // A global factor to relax inter-object clearance (1.0 == strict sum of radii).
+    // Use a permissive default (0.6) for small arenas; user can tune via configuration.
+    const float inter_object_relax_factor = config["parameters"]["teleport_inter_object_clearance_factor"].get(0.6f);
+    for (auto &obj : phys_objects) {
+        if (!obj) continue;
+        // skip self
+        if (obj.get() == target.get()) continue;
+        // Skip walls / arena objects which have very large ids (created with current_other_id starting at 65535)
+        // These are handled by the distance-to-wall check above.
+        if (obj->id >= 60000) continue;
+
+        // object may not have up-to-date x/y if it's a body; use stored object coordinates
+        float ox = obj->x;
+        float oy = obj->y;
+        float other_r = obj->get_geometry()->compute_bounding_disk().radius;
+
+        float dx = x - ox;
+        float dy = y - oy;
+        float d2 = dx*dx + dy*dy;
+        float min_allowed = target->get_geometry()->compute_bounding_disk().radius + other_r + inter_object_buffer;
+        // Relax the required clearance by a configurable factor (useful for small arenas).
+        min_allowed *= inter_object_relax_factor;
+        if (d2 < (min_allowed * min_allowed)) {
+            return false;
+        }
+    }
+
+    // safe: perform teleport
+    target->move(x, y, theta);
+    return true;
+}
+
 
 /************* SIMULATION *************/ // {{{1
 
