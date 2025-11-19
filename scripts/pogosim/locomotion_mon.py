@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from pogosim import utils
 from pogosim import __version__
+import tempfile
 
 
 ############### MSD ############### {{{1
@@ -258,8 +259,8 @@ def _compile_gif(
 # ──────────────────────────────────────────────────────────────────────
 def _render_single_run(
     run_df: pd.DataFrame,
-    run_output_dir: Path,
     *,
+    gif_path: Path,
     k_steps: int,
     robot_cmap_name: str,
     point_size: int,
@@ -268,7 +269,6 @@ def _render_single_run(
     dpi: int,
     make_gif: bool,
     gif_fps: int,
-    gif_name: str,
     gifski_bin: str,
     margin_frac: float = 0.03,
 ) -> List[str]:
@@ -276,182 +276,174 @@ def _render_single_run(
     High-performance version: same visual output, far faster.
     Avoids per-frame figure creation and avoids all DataFrame operations inside the loop.
     """
-    # Sort once
-    run_df = run_df.sort_values(["time", "robot_id"], ignore_index=True)
+    # Create a dedicated tmp directory for this run's frames
+    tmpdir = Path(tempfile.mkdtemp(prefix="trace_frames_"))
 
-    # Extract unique times
-    times = run_df["time"].to_numpy()
-    unique_times = np.unique(times)
+    try:
+        # Sort once
+        run_df = run_df.sort_values(["time", "robot_id"], ignore_index=True)
 
-    # Remove walls for bounds
-    if "robot_category" in run_df.columns:
-        df_plot = run_df[run_df["robot_category"] != "walls"]
-    else:
-        df_plot = run_df
+        # Extract unique times
+        times = run_df["time"].to_numpy()
+        unique_times = np.unique(times)
 
-    xs_all = df_plot["x"].to_numpy()
-    ys_all = df_plot["y"].to_numpy()
-
-    # Global bounds
-    x_min, x_max = xs_all.min(), xs_all.max()
-    y_min, y_max = ys_all.min(), ys_all.max()
-
-    dx = x_max - x_min
-    dy = y_max - y_min
-    x_min -= dx * margin_frac
-    x_max += dx * margin_frac
-    y_min -= dy * margin_frac
-    y_max += dy * margin_frac
-
-    # Category map
-    if "robot_category" in run_df.columns:
-        category_map = run_df.groupby("robot_id", sort=False)["robot_category"].first().to_dict()
-    else:
-        category_map = {}
-
-    # Pre-split into per-robot NumPy arrays
-    robots = {}
-    for rid, g in run_df.groupby("robot_id"):
-        arr = g[["time", "x", "y"]].to_numpy()
-        robots[rid] = arr
-
-    # Colour assignment:
-    #   - animals are green
-    #   - everything else gets a colour
-    cmap = get_cmap(robot_cmap_name)
-
-    # Determine all non-animal robots
-    colour_ids = []
-    for rid in robots:
-        cat = category_map.get(rid, "agents")
-        if cat != "animals":
-            colour_ids.append(rid)
-
-    colour_ids = np.sort(colour_ids)
-    colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(colour_ids)}
-
-    # Prepare artists
-    run_output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Prepare figure once
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
-    ax.set_aspect("equal")
-    ax.set_facecolor("white")
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_xticks([]); ax.set_yticks([])
-
-    line_artists = {}
-    point_artists = {}
-
-    from matplotlib.collections import LineCollection
-
-    # Create artist containers
-    for rid in robots:
-        cat = category_map.get(rid, "agents")
-        if cat == "animals":
-            # Only green point
-            sc = ax.scatter([], [], s=point_size, c="green", edgecolors="none")
-            point_artists[rid] = sc
+        # Remove walls for bounds
+        if "robot_category" in run_df.columns:
+            df_plot = run_df[run_df["robot_category"] != "walls"]
         else:
-            # Line + coloured head point
-            lc = LineCollection([], linewidths=line_width, capstyle="round", joinstyle="round")
-            ax.add_collection(lc)
-            line_artists[rid] = lc
+            df_plot = run_df
 
-            col = colour_map[rid]
-            sc = ax.scatter([], [], s=point_size, c=[col], edgecolors="none")
-            point_artists[rid] = sc
+        xs_all = df_plot["x"].to_numpy()
+        ys_all = df_plot["y"].to_numpy()
 
-    title_obj = ax.set_title("")
+        # Global bounds
+        x_min, x_max = xs_all.min(), xs_all.max()
+        y_min, y_max = ys_all.min(), ys_all.max()
 
-    fig.tight_layout()
+        dx = x_max - x_min
+        dy = y_max - y_min
+        x_min -= dx * margin_frac
+        x_max += dx * margin_frac
+        y_min -= dy * margin_frac
+        y_max += dy * margin_frac
 
-    frame_paths = []
-    tail_times = []
+        # Category map
+        if "robot_category" in run_df.columns:
+            category_map = run_df.groupby("robot_id", sort=False)["robot_category"].first().to_dict()
+        else:
+            category_map = {}
 
-    # Main loop (fast)
-    for current_time in tqdm(unique_times):
-        tail_times.append(current_time)
-        if len(tail_times) > k_steps:
-            tail_times.pop(0)
+        # Pre-split into per-robot NumPy arrays
+        robots = {
+            rid: g[["time", "x", "y"]].to_numpy()
+            for rid, g in run_df.groupby("robot_id")
+        }
 
-        t_old = tail_times[0]
-        t_new = tail_times[-1]
-        age_den = (t_new - t_old) or 1.0
+        # Colour assignment:
+        #   - animals are green
+        #   - everything else gets a colour
 
-        # Update each robot
-        for rid, arr in robots.items():
-            ts = arr[:, 0]
-            xs = arr[:, 1]
-            ys = arr[:, 2]
+        cmap = get_cmap(robot_cmap_name)
+        colour_ids = [rid for rid in robots if category_map.get(rid, "agents") != "animals"]
+        colour_ids = np.sort(colour_ids)
+        colour_map = {rid: cmap(i % cmap.N)[:3] for i, rid in enumerate(colour_ids)}
 
-            mask = (ts >= t_old) & (ts <= t_new)
-            if not np.any(mask):
-                if rid in line_artists:
-                    line_artists[rid].set_segments([])
-                point_artists[rid].set_offsets(np.empty((0, 2)))
-                continue
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
+        ax.set_aspect("equal")
+        ax.set_facecolor("white")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-            xs_win = xs[mask]
-            ys_win = ys[mask]
-            ts_win = ts[mask]
+        line_artists = {}
+        point_artists = {}
 
+        # Create artist containers
+        for rid in robots:
             cat = category_map.get(rid, "agents")
-
             if cat == "animals":
-                point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
-                continue
-
-            # Agents / non-animal bots
-            if len(xs_win) >= 2:
-                segs = np.stack(
-                    [
-                        np.column_stack([xs_win[:-1], ys_win[:-1]]),
-                        np.column_stack([xs_win[1:], ys_win[1:]])
-                    ],
-                    axis=1
-                )
-                seg_ages = (ts_win[1:] - t_old) / age_den
-                alphas = fade_min_alpha + (1 - fade_min_alpha) * seg_ages
-                cols = [(*colour_map[rid], a) for a in alphas]
-
-                line_artists[rid].set_segments(segs)
-                line_artists[rid].set_color(cols)
+                # Only green point
+                sc = ax.scatter([], [], s=point_size, c="green", edgecolors="none")
+                point_artists[rid] = sc
             else:
-                line_artists[rid].set_segments([])
+                # Line + coloured head point
+                lc = LineCollection([], linewidths=line_width, capstyle="round", joinstyle="round")
+                ax.add_collection(lc)
+                line_artists[rid] = lc
 
-            # Head point
-            point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+                col = colour_map[rid]
+                sc = ax.scatter([], [], s=point_size, c=[col], edgecolors="none")
+                point_artists[rid] = sc
 
-        title_obj.set_text(f"time = {current_time:.3f}   (tail = {len(tail_times)} steps)")
+        title_obj = ax.set_title("")
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.92)  # give space for the title
 
-        # Save frame
-        fname = run_output_dir / f"trace_{current_time:.6f}.png"
-        fig.savefig(fname, dpi=dpi)
-        frame_paths.append(str(fname.resolve()))
+        frame_paths = []
+        tail_times = []
 
-    plt.close(fig)
+        # Main loop (fast)
+        for current_time in tqdm(unique_times):
+            tail_times.append(current_time)
+            if len(tail_times) > k_steps:
+                tail_times.pop(0)
 
-    # Compile GIF if needed
-    if make_gif and frame_paths:
-        _compile_gif(frame_paths,
-                     run_output_dir / gif_name,
-                     fps=gif_fps,
-                     gifski_bin=gifski_bin)
+            t_old = tail_times[0]
+            t_new = tail_times[-1]
+            age_den = (t_new - t_old) or 1.0
 
-    return frame_paths
+            # Update each robot
+            for rid, arr in robots.items():
+                ts = arr[:, 0]
+                xs = arr[:, 1]
+                ys = arr[:, 2]
+
+                mask = (ts >= t_old) & (ts <= t_new)
+                if not np.any(mask):
+                    if rid in line_artists:
+                        line_artists[rid].set_segments([])
+                    point_artists[rid].set_offsets(np.empty((0, 2)))
+                    continue
+
+                xs_win = xs[mask]
+                ys_win = ys[mask]
+                ts_win = ts[mask]
+
+                cat = category_map.get(rid, "agents")
+
+                if cat == "animals":
+                    point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+                    continue
+
+                # Agents / non-animal bots
+                if len(xs_win) >= 2:
+                    segs = np.stack(
+                        [
+                            np.column_stack([xs_win[:-1], ys_win[:-1]]),
+                            np.column_stack([xs_win[1:], ys_win[1:]])
+                        ],
+                        axis=1
+                    )
+                    seg_ages = (ts_win[1:] - t_old) / age_den
+                    alphas = fade_min_alpha + (1 - fade_min_alpha) * seg_ages
+                    cols = [(*colour_map[rid], a) for a in alphas]
+                    line_artists[rid].set_segments(segs)
+                    line_artists[rid].set_color(cols)
+                else:
+                    line_artists[rid].set_segments([])
+
+                # Head point
+                point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+
+            title_obj.set_text(f"time = {current_time:.0f}")
+
+            # Save frame into this run's tmp folder
+            fname = tmpdir / f"frame_{current_time:.6f}.png"
+            fig.savefig(fname, dpi=dpi)
+            frame_paths.append(str(fname))
+
+        plt.close(fig)
+
+        # Compile GIF
+        if make_gif and frame_paths:
+            _compile_gif(frame_paths, gif_path=gif_path, fps=gif_fps, gifski_bin=gifski_bin)
+
+    finally:
+        # Delete the entire temporary frames directory
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return []
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  worker wrapper (needed for Pool.map)
 # ──────────────────────────────────────────────────────────────────────
-def _process_run(args: Tuple[int, pd.DataFrame, str, dict]) -> Tuple[int, List[str]]:
-    run_val, run_df, out_dir_str, kw = args
-    paths = _render_single_run(run_df,
-                               Path(out_dir_str),
-                               **kw)
-    return run_val, paths
+def _process_run(args):
+    run_val, run_df, gif_path_str, kw = args
+    gif_path = Path(gif_path_str)
+    _render_single_run(run_df, gif_path=gif_path, **kw)
+    return run_val, []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -476,11 +468,9 @@ def generate_trace_images(
     # GIF options
     make_gif: bool = False,
     gif_fps: int = 20,
-    gif_name: str = "result-trace.gif",
     gifski_bin: str = "gifski",
     # Parallelism
-    n_jobs: int | None = None,
-) -> Union[List[str], Dict[int, List[str]]]:
+    n_jobs: int | None = None):
     """
     Render fading-trail PNGs (and optional GIFs) from a robot-trace dataframe.
 
@@ -491,10 +481,10 @@ def generate_trace_images(
     """
     df = df.copy()
 
-    # ---- apply start_time / end_time filter if provided --------------
+    # Time filtering
     if start_time is not None or end_time is not None:
         if "time" not in df.columns:
-            raise ValueError("DataFrame has no 'time' column for time filtering")
+            raise ValueError("DataFrame has no 'time' column")
         tmin = df["time"].min()
         tmax = df["time"].max()
         t0 = start_time if start_time is not None else tmin
@@ -503,71 +493,10 @@ def generate_trace_images(
             t0, t1 = t1, t0
         df = df[(df["time"] >= float(t0)) & (df["time"] <= float(t1))].copy()
 
-    # ------------ single-run request -------------------------------------
-    if run_id is not None:
-        if "run" in df.columns:
-            df = df[df["run"] == run_id]
-        return _render_single_run(
-            df,
-            Path(output_dir),
-            k_steps=k_steps,
-            robot_cmap_name=robot_cmap_name,
-            point_size=point_size,
-            line_width=line_width,
-            fade_min_alpha=fade_min_alpha,
-            dpi=dpi,
-            make_gif=make_gif,
-            gif_fps=gif_fps,
-            gif_name=gif_name,
-            gifski_bin=gifski_bin,
-        )
+    base_dir = Path(output_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------ automatic per-run processing ---------------------------
-    if "run" in df.columns:
-        runs = sorted(df["run"].unique())
-        base_dir = Path(output_dir)
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        # common kwargs for _render_single_run
-        common_kw = dict(
-            k_steps=k_steps,
-            robot_cmap_name=robot_cmap_name,
-            point_size=point_size,
-            line_width=line_width,
-            fade_min_alpha=fade_min_alpha,
-            dpi=dpi,
-            make_gif=make_gif,
-            gif_fps=gif_fps,
-            gif_name=gif_name,
-            gifski_bin=gifski_bin,
-        )
-
-        # prepare task list (arg tuple per run)
-        tasks: List[Tuple[int, pd.DataFrame, str, dict]] = [
-            (
-                r,
-                df[df["run"] == r],
-                str(base_dir / run_fmt.format(run=r)),
-                common_kw,
-            )
-            for r in runs
-        ]
-
-        # sequential if n_jobs == 1
-        if n_jobs == 1:
-            results = [_process_run(t) for t in tasks]
-        else:
-            workers = n_jobs or os.cpu_count() or 1
-            ctx = mp.get_context("spawn")   # safest across platforms
-            with ctx.Pool(processes=workers) as pool:
-                results = pool.map(_process_run, tasks)
-
-        return {run_val: paths for run_val, paths in results}
-
-    # ------------ dataframe without 'run' column → treat as single run ---
-    return _render_single_run(
-        df,
-        Path(output_dir),
+    common_kw = dict(
         k_steps=k_steps,
         robot_cmap_name=robot_cmap_name,
         point_size=point_size,
@@ -576,10 +505,43 @@ def generate_trace_images(
         dpi=dpi,
         make_gif=make_gif,
         gif_fps=gif_fps,
-        gif_name=gif_name,
         gifski_bin=gifski_bin,
     )
 
+    # Single-run
+    if run_id is not None:
+        if "run" in df.columns:
+            df = df[df["run"] == run_id]
+        gif_path = base_dir / f"trace_{run_id}.gif"
+        return _render_single_run(df, gif_path=gif_path, **common_kw)
+
+    # Multi-run
+    if "run" in df.columns:
+        runs = sorted(df["run"].unique())
+
+        tasks = [
+            (
+                r,
+                df[df["run"] == r],
+                str(base_dir / f"trace_{r}.gif"),
+                common_kw,
+            )
+            for r in runs
+        ]
+
+        if n_jobs == 1:
+            results = [_process_run(t) for t in tasks]
+        else:
+            workers = n_jobs or os.cpu_count() or 1
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=workers) as pool:
+                results = pool.map(_process_run, tasks)
+
+        return {r: [] for r, _ in results}
+
+    # No run column → treat as run 0
+    gif_path = base_dir / "trace_0.gif"
+    return _render_single_run(df, gif_path=gif_path, **common_kw)
 
 ############### MAIN ############### {{{1
 
