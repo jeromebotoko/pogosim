@@ -390,7 +390,7 @@ def _render_single_run(
                 txt = ax.text(
                     0,
                     0,
-                    str(rid),
+                    str(rid) if cat == "agents" else "",
                     color=txt_color,
                     fontsize=8,
                     ha="left",
