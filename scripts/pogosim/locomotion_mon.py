@@ -279,7 +279,7 @@ def _render_single_run(
     make_gif: bool,
     gif_fps: int,
     gifski_bin: str,
-    show_labels: bool = True,
+    label_mode: str = "id",
     margin_frac: float = 0.03,
 ) -> List[str]:
     """
@@ -360,9 +360,23 @@ def _render_single_run(
         ax.set_xticks([])
         ax.set_yticks([])
 
+        label_mode = (label_mode or "none").lower()
+        if label_mode not in {"none", "id", "reward"}:
+            raise ValueError("label_mode must be one of: none, id, reward")
+
+        # Reward lookup for labels (per agent, last/max over time)
+        reward_map: Dict[int, float] | None = None
+        if label_mode == "reward" and "G" in run_df.columns:
+            reward_map = (
+                run_df.groupby("robot_id")["G"]
+                .max()
+                .fillna(0)
+                .to_dict()  # type: ignore[assignment]
+            )
+
         line_artists = {}
         point_artists = {}
-        text_artists = {} if show_labels else None
+        text_artists = {} if label_mode != "none" else None
 
         # Create artist containers
         for rid in robots:
@@ -383,14 +397,12 @@ def _render_single_run(
                 sc = ax.scatter([], [], s=point_size, c=[col], edgecolors="none")
                 point_artists[rid] = sc
 
-            if show_labels:
-                txt_color = (
-                    "green" if cat == "animals" else colour_map.get(rid, "black")
-                )
+            if label_mode != "none" and cat != "animals":
+                txt_color = colour_map.get(rid, "black")
                 txt = ax.text(
                     0,
                     0,
-                    str(rid) if cat == "agents" else "",
+                    "",
                     color=txt_color,
                     fontsize=8,
                     ha="left",
@@ -427,7 +439,7 @@ def _render_single_run(
                     if rid in line_artists:
                         line_artists[rid].set_segments([])
                     point_artists[rid].set_offsets(np.empty((0, 2)))
-                    if show_labels:
+                    if label_mode != "none":
                         text_artists[rid].set_visible(False)
                     continue
 
@@ -440,11 +452,6 @@ def _render_single_run(
                 if cat == "animals":
                     head = (xs_win[-1], ys_win[-1])
                     point_artists[rid].set_offsets([head])
-                    if show_labels:
-                        text_artists[rid].set_position(
-                            (head[0] + label_offset, head[1] + label_offset)
-                        )
-                        text_artists[rid].set_visible(True)
                     continue
 
                 # Agents / non-animal bots
@@ -467,11 +474,28 @@ def _render_single_run(
                 # Head point
                 head = (xs_win[-1], ys_win[-1])
                 point_artists[rid].set_offsets([head])
-                if show_labels:
-                    text_artists[rid].set_position(
-                        (head[0] + label_offset, head[1] + label_offset)
-                    )
-                    text_artists[rid].set_visible(True)
+                if label_mode != "none":
+                    label_text: Optional[str] = None
+                    if label_mode == "id":
+                        label_text = str(rid)
+                    elif label_mode == "reward" and reward_map is not None:
+                        reward_val = reward_map.get(rid, 0)
+                        if reward_val >= 1:
+                            label_text = (
+                                str(int(reward_val))
+                                if float(reward_val).is_integer()
+                                else f"{reward_val:.2f}"
+                            )
+
+                    text_art = text_artists[rid]
+                    if label_text is not None:
+                        text_art.set_text(label_text)
+                        text_art.set_position(
+                            (head[0] + label_offset, head[1] + label_offset)
+                        )
+                        text_art.set_visible(True)
+                    else:
+                        text_art.set_visible(False)
 
             title_obj.set_text(f"time = {current_time:.0f}")
 
@@ -530,7 +554,7 @@ def generate_trace_images(
     gifski_bin: str = "gifski",
     # Parallelism
     n_jobs: int | None = None,
-    show_labels: bool = True,
+    label_mode: str = "id",
 ):
     """
     Render fading-trail PNGs (and optional GIFs) from a robot-trace dataframe.
@@ -558,6 +582,10 @@ def generate_trace_images(
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    label_mode = (label_mode or "none").lower()
+    if label_mode not in {"none", "id", "reward"}:
+        raise ValueError("label_mode must be one of: none, id, reward")
+
     common_kw = dict(
         k_steps=k_steps,
         robot_cmap_name=robot_cmap_name,
@@ -568,7 +596,7 @@ def generate_trace_images(
         make_gif=make_gif,
         gif_fps=gif_fps,
         gifski_bin=gifski_bin,
-        show_labels=show_labels,
+        label_mode=label_mode,
     )
 
     # Single-run
@@ -616,7 +644,7 @@ def create_all_locomotion_plots(
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
     plot_run_id: Optional[int] = None,
-    show_labels: bool = True,
+    label_mode: str = "id",
 ):
     print(f"Creating locomotion plots from '{input_file}' into '{output_dir}'...")
     os.makedirs(output_dir, exist_ok=True)
@@ -649,7 +677,7 @@ def create_all_locomotion_plots(
         start_time=start_time,
         end_time=end_time,
         run_id=plot_run_id,
-        show_labels=show_labels,
+        label_mode=label_mode,
     )
 
 
@@ -687,9 +715,10 @@ if __name__ == "__main__":
         "--run_id", type=int, default=None, help="If provided, only process this run ID"
     )
     parser.add_argument(
-        "--hide_labels",
-        action="store_true",
-        help="Do not draw robot ID labels next to traces",
+        "--label_mode",
+        choices=["none", "id", "reward"],
+        default="id",
+        help="Label strategy for agents: none, id, or accumulated reward (G>=1 only)",
     )
     args = parser.parse_args()
 
@@ -701,7 +730,7 @@ if __name__ == "__main__":
         start_time=args.start_time,
         end_time=args.end_time,
         plot_run_id=args.run_id,
-        show_labels=not args.hide_labels,
+        label_mode=args.label_mode,
     )
 
 
