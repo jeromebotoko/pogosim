@@ -499,6 +499,7 @@ def generate_trace_images(
           are processed in **parallel** with a multiprocessing pool (`n_jobs` workers).
         • Set `n_jobs=1` to disable the pool (sequential).
     """
+    print("Generating trace images...")
     df = df.copy()
 
     # Time filtering
@@ -574,11 +575,14 @@ def create_all_locomotion_plots(
     end_time: Optional[float] = None,
     plot_run_id: Optional[int] = None,
 ):
+    print(f"Creating locomotion plots from '{input_file}' into '{output_dir}'...")
     os.makedirs(output_dir, exist_ok=True)
 
     # Load data
     df, meta = utils.load_dataframe(input_file)
     config = meta.get("configuration", {})
+
+    print(f"Data loaded with {len(df):,} rows.")
 
     # Insert a run column, might be needed for some plotting functions
     if "run" not in df.columns:
