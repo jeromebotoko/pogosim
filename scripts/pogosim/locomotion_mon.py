@@ -279,6 +279,7 @@ def _render_single_run(
     make_gif: bool,
     gif_fps: int,
     gifski_bin: str,
+    show_labels: bool = True,
     margin_frac: float = 0.03,
 ) -> List[str]:
     """
@@ -292,18 +293,23 @@ def _render_single_run(
         # Sort once
         run_df = run_df.sort_values(["time", "robot_id"], ignore_index=True)
 
-        # Extract unique times
+        # Drop walls altogether (either tagged as category or special id)
+        wall_mask = np.zeros(len(run_df), dtype=bool)
+        if "robot_category" in run_df.columns:
+            wall_mask |= run_df["robot_category"] == "walls"
+        if "robot_id" in run_df.columns:
+            wall_mask |= run_df["robot_id"] == 65535
+        if wall_mask.any():
+            run_df = run_df.loc[~wall_mask].reset_index(drop=True)
+
+        if run_df.empty:
+            return []
+
         times = run_df["time"].to_numpy()
         unique_times = np.unique(times)
 
-        # Remove walls for bounds
-        if "robot_category" in run_df.columns:
-            df_plot = run_df[run_df["robot_category"] != "walls"]
-        else:
-            df_plot = run_df
-
-        xs_all = df_plot["x"].to_numpy()
-        ys_all = df_plot["y"].to_numpy()
+        xs_all = run_df["x"].to_numpy()
+        ys_all = run_df["y"].to_numpy()
 
         # Global bounds
         x_min, x_max = xs_all.min(), xs_all.max()
@@ -315,6 +321,9 @@ def _render_single_run(
         x_max += dx * margin_frac
         y_min -= dy * margin_frac
         y_max += dy * margin_frac
+        label_offset = 0.01 * max(
+            dx, dy, 1.0
+        )  # keep id labels readable even on small arenas
 
         # Category map
         if "robot_category" in run_df.columns:
@@ -353,6 +362,7 @@ def _render_single_run(
 
         line_artists = {}
         point_artists = {}
+        text_artists = {} if show_labels else None
 
         # Create artist containers
         for rid in robots:
@@ -372,6 +382,22 @@ def _render_single_run(
                 col = colour_map[rid]
                 sc = ax.scatter([], [], s=point_size, c=[col], edgecolors="none")
                 point_artists[rid] = sc
+
+            if show_labels:
+                txt_color = (
+                    "green" if cat == "animals" else colour_map.get(rid, "black")
+                )
+                txt = ax.text(
+                    0,
+                    0,
+                    str(rid),
+                    color=txt_color,
+                    fontsize=8,
+                    ha="left",
+                    va="center",
+                    visible=False,
+                )
+                text_artists[rid] = txt
 
         title_obj = ax.set_title("")
         fig.tight_layout()
@@ -401,6 +427,8 @@ def _render_single_run(
                     if rid in line_artists:
                         line_artists[rid].set_segments([])
                     point_artists[rid].set_offsets(np.empty((0, 2)))
+                    if show_labels:
+                        text_artists[rid].set_visible(False)
                     continue
 
                 xs_win = xs[mask]
@@ -410,7 +438,13 @@ def _render_single_run(
                 cat = category_map.get(rid, "agents")
 
                 if cat == "animals":
-                    point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+                    head = (xs_win[-1], ys_win[-1])
+                    point_artists[rid].set_offsets([head])
+                    if show_labels:
+                        text_artists[rid].set_position(
+                            (head[0] + label_offset, head[1] + label_offset)
+                        )
+                        text_artists[rid].set_visible(True)
                     continue
 
                 # Agents / non-animal bots
@@ -431,7 +465,13 @@ def _render_single_run(
                     line_artists[rid].set_segments([])
 
                 # Head point
-                point_artists[rid].set_offsets([[xs_win[-1], ys_win[-1]]])
+                head = (xs_win[-1], ys_win[-1])
+                point_artists[rid].set_offsets([head])
+                if show_labels:
+                    text_artists[rid].set_position(
+                        (head[0] + label_offset, head[1] + label_offset)
+                    )
+                    text_artists[rid].set_visible(True)
 
             title_obj.set_text(f"time = {current_time:.0f}")
 
@@ -490,6 +530,7 @@ def generate_trace_images(
     gifski_bin: str = "gifski",
     # Parallelism
     n_jobs: int | None = None,
+    show_labels: bool = True,
 ):
     """
     Render fading-trail PNGs (and optional GIFs) from a robot-trace dataframe.
@@ -527,6 +568,7 @@ def generate_trace_images(
         make_gif=make_gif,
         gif_fps=gif_fps,
         gifski_bin=gifski_bin,
+        show_labels=show_labels,
     )
 
     # Single-run
@@ -574,6 +616,7 @@ def create_all_locomotion_plots(
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
     plot_run_id: Optional[int] = None,
+    show_labels: bool = True,
 ):
     print(f"Creating locomotion plots from '{input_file}' into '{output_dir}'...")
     os.makedirs(output_dir, exist_ok=True)
@@ -606,6 +649,7 @@ def create_all_locomotion_plots(
         start_time=start_time,
         end_time=end_time,
         run_id=plot_run_id,
+        show_labels=show_labels,
     )
 
 
@@ -642,6 +686,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run_id", type=int, default=None, help="If provided, only process this run ID"
     )
+    parser.add_argument(
+        "--hide_labels",
+        action="store_true",
+        help="Do not draw robot ID labels next to traces",
+    )
     args = parser.parse_args()
 
     input_file = args.input_file
@@ -652,6 +701,7 @@ if __name__ == "__main__":
         start_time=args.start_time,
         end_time=args.end_time,
         plot_run_id=args.run_id,
+        show_labels=not args.hide_labels,
     )
 
 
