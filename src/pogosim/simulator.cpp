@@ -524,7 +524,17 @@ void Simulation::init_config() {
     enable_gui = config["GUI"].get(true);
     GUI_speed_up = config["GUI_speed_up"].get(1.0f);
 
-    std::srand(std::time(nullptr));
+    int seed = config["parameters"]["seed"].get(-1);
+    
+    if (seed == -1) {
+        seed = std::time(nullptr);
+        glogger->info("Random seed not set, setting it to {}", seed);
+    } else {
+        glogger->info("Random seed set from configuration: {}", seed);
+    }
+    rnd_gen.seed(seed);
+
+    std::srand(seed);
 }
 
 
